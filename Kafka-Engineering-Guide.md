@@ -245,6 +245,28 @@ Partition 0:  ┌────┬────┬────┬────┬─
 
 This is the mechanism behind Kafka's superpower: **replay**. Reset your offset to 0 and reprocess the entire history.
 
+#### Where committed offsets live
+
+The broker does keep a "map" of how far each reader has got, but it is keyed by **consumer group + topic + partition**, not by individual consumer. It is stored in Kafka itself, in an internal compacted topic called `__consumer_offsets`:
+
+```
+key:    (group.id, topic, partition)
+value:  (offset, metadata, commit timestamp)
+```
+
+- Because the topic is **compacted**, only the latest offset per key survives.
+- Because it is a normal **replicated** topic, the bookmarks survive broker failures like any other data.
+- Each group is assigned a **group coordinator** (one broker, chosen by hashing the `group.id`). Commits, heartbeats, and rebalances for that group go to the coordinator, not to the partition leader.
+- The key is the *group*, not the consumer, so when a partition moves to another member during a rebalance the new owner picks up the same bookmark.
+
+What the broker does **not** do with the offset:
+
+- It does not track a consumer's live read position, only what the consumer has explicitly committed. A consumer can be thousands of records ahead of its committed offset.
+- It does not enforce anything. A consumer can `seek()` anywhere. The commit is a bookmark the consumer saves for itself, not a lock.
+- Consumers with no `group.id` that use manual `assign()` commit nothing here. They manage offsets themselves.
+
+Consumer lag falls out of this directly: latest offset in the partition minus the value stored in `__consumer_offsets`.
+
 ### 4.5 Producers
 
 A **producer** is a client application that publishes (writes) records to topics.
@@ -265,6 +287,47 @@ graph LR
     Part --> Buf[Record Batches / Buffer]
     Buf --> Br[(Kafka Broker)]
 ```
+
+#### How batching works and the `linger.ms` window
+
+The producer does not send records one at a time. After serializing a record and picking its partition, it places the record into an in-memory buffer grouped **per destination partition**. That group is a **batch**. The whole batch is compressed and sent to the partition leader in one request.
+
+There is a short window during which the producer collects records into a batch. You control that window with `linger.ms`. When the first record lands in an empty batch, a timer starts. The batch is sent when **either** of these happens first:
+
+- the `linger.ms` timer expires, or
+- the batch reaches `batch.size` bytes.
+
+So `linger.ms` is the **maximum** time a record waits in the buffer, an upper bound rather than a fixed delay.
+
+```
+batch.size         max bytes per partition batch before it is sent
+linger.ms          how long to wait for more records before sending a partial batch
+compression.type   none | gzip | snappy | lz4 | zstd
+buffer.memory      total memory the producer may use for unsent batches
+```
+
+Typical values:
+
+```
+linger.ms=0     (default)  send as soon as a sender thread is free.
+                           Batching still happens under load, because records pile up
+                           while the previous request is in flight.
+
+linger.ms=5     wait up to 5 ms to collect more records per partition.
+                Common production sweet spot: bigger batches, tiny latency cost.
+
+linger.ms=100   throughput-oriented (log shipping, CDC). Each record may wait up to 100 ms.
+```
+
+Why batch and compress at all:
+
+- Fewer network round trips and fewer disk appends on the broker.
+- Compression works far better on a batch than on a single tiny record, because there is more repeated structure to squeeze.
+- The batch stays compressed on the broker's disk and is decompressed by the consumer, so the broker does very little CPU work.
+
+The trade-off is the reason Kafka is high-throughput but not a microsecond-latency system. Higher `linger.ms` means larger, more efficient batches, and each record waits a little longer before leaving the producer. Even at `linger.ms=0` you rarely get one-record batches under real traffic, because the sender can only have a limited number of requests in flight per broker, and records arriving in the meantime accumulate into the next batch. `linger.ms` matters most at low or bursty traffic where the buffer would otherwise be sent nearly empty.
+
+This window is entirely on the producer side. Brokers and consumers know nothing about it. The consumer side has a mirror setting, `fetch.max.wait.ms`, which controls how long the broker waits to fill a fetch response before replying.
 
 ### 4.6 Consumers & Consumer Groups
 
@@ -309,6 +372,38 @@ graph TD
 ```
 
 This dual behavior lets Kafka act as **both** a queue (competing consumers within a group) **and** a publish/subscribe system (multiple groups) at the same time.
+
+To be precise about the rule: a partition is consumed by **exactly one consumer within a group**, but that same partition can be consumed by **many consumers at once as long as they are in different groups**. All of them read the same bytes from the same leader replica. The broker does not copy the data per group; it just serves fetch requests from the log at whatever offset each group asks for.
+
+```
+Topic orders, partition 0
+
+  group billing     ->  consumer B1  committed offset 8,400
+  group analytics   ->  consumer A3  committed offset 8,900
+  group fraud       ->  consumer F1  committed offset 2,100  (lagging; nobody else cares)
+```
+
+#### What should be in one consumer group?
+
+**One consumer group = the replicas of one application.** Every instance of a service uses the same `group.id`, typically the service name fixed in its config. Instances are told apart by `client.id` (for metrics) and optionally `group.instance.id` (for static membership).
+
+```
+topic: orders
+
+group "billing-service"    ->  billing pod 1, billing pod 2, billing pod 3
+group "search-indexer"     ->  indexer pod 1, indexer pod 2
+group "analytics"          ->  analytics pod 1
+```
+
+Do **not** put different applications in the same group. A group has one shared set of committed offsets per partition, and each partition goes to exactly one member. If a billing consumer and a search-indexer consumer shared a group, billing would receive partitions 0 and 1 and the indexer partitions 2 and 3. Half the orders would never be billed and half would never be indexed. Each application would see a random slice of the stream instead of the whole thing.
+
+Consequences of this rule:
+
+- Each application scales independently against the same partitions. Scaling one service up or down triggers a rebalance only inside its own group.
+- A group's maximum useful replica count equals the topic's partition count. Two groups of five on a four-partition topic is fine; each group independently has one idle member.
+- Consumers with no `group.id` that use manual `assign()` sit outside this rule. You can point ten of them at the same partition and Kafka will not stop you, but none of them commit to a group.
+
+The rare legitimate exception is two builds of the *same* service sharing a group, for example blue and green deployments during a rolling upgrade. From Kafka's point of view they are still one application.
 
 ### 4.7 Brokers & the Cluster
 
@@ -373,6 +468,32 @@ Replication Factor = 3, min.insync.replicas = 2
                  write needs 2 acks ──► committed
 ```
 
+#### What `min.insync.replicas` does and does not gate
+
+This setting is **not** a prerequisite for every action in Kafka. It gates exactly one thing: **accepting a write when the producer asks for `acks=all`**.
+
+Before the leader acknowledges an `acks=all` write, it checks how many replicas are currently in the ISR. If that count is below `min.insync.replicas`, the leader rejects the write with `NotEnoughReplicasException`. The producer retries and eventually fails.
+
+It does **not** affect:
+
+- Writes with `acks=0` or `acks=1`. The setting is ignored for those producers entirely.
+- Reads. Consumers can still fetch everything already committed on the partition.
+- Topic creation, offset commits, rebalances, admin work.
+
+Why it exists: `acks=all` on its own means "wait for all replicas *currently in the ISR*." If two of three brokers die, the ISR shrinks to just the leader and `acks=all` silently degrades to `acks=1`. `min.insync.replicas` is the floor that stops that degradation: "if fewer than N copies can confirm, refuse the write rather than pretend it is durable."
+
+The scope is **per partition**, because the ISR is tracked per partition. If partition 2's replicas sit on two dead brokers while partition 0's are healthy, partition 0 keeps accepting writes and only partition 2 becomes read-only for strict producers. With keyed records this shows up as "some orders fail, most succeed" rather than a total outage, because a specific set of keys maps to the blocked partition.
+
+The usual recipe:
+
+```
+replication.factor      = 3
+min.insync.replicas     = 2
+producer acks           = all
+```
+
+This tolerates one broker down with zero data loss and keeps accepting writes. Lose two brokers and the affected partitions go read-only for `acks=all` producers until a replica catches up. That is the trade-off: write availability versus a durability guarantee you can trust. It is a broker default and a per-topic override, so you can be strict on a payments topic and relaxed on a metrics topic in the same cluster.
+
 ### 4.9 ZooKeeper vs KRaft
 
 Kafka needs to store cluster metadata (which brokers exist, who leads each partition, configs, ACLs).
@@ -419,6 +540,11 @@ Step by step:
 5. **Consume:** consumers **poll** the leader, fetch batches starting from their last committed offset, deserialize, and process.
 6. **Commit offset:** the consumer records how far it has processed, so it can resume after a restart.
 
+Two simplifications in the diagram worth knowing:
+
+- `P->>P: Add to batch (compress)` is where the `linger.ms` window from [Section 4.5](#45-producers) happens. The self-arrow means the producer is working alone; only the next line is a network send.
+- `C->>L: Commit offset` actually goes to the group's **coordinator** broker and is written to `__consumer_offsets` (see [Section 4.4](#44-offsets)), not to the partition leader.
+
 ---
 
 ## 6. Delivery Guarantees & Reliability
@@ -430,6 +556,52 @@ Kafka supports three delivery semantics. Understanding them is critical for corr
 | **At-most-once** | Each message delivered 0 or 1 times | Commit offset *before* processing; no retries | Messages can be **lost** |
 | **At-least-once** | Each message delivered 1+ times | Commit offset *after* processing; retries on failure | **Duplicates** possible |
 | **Exactly-once** | Each message effect applied exactly once | Idempotent producer + transactions | Most complex, some overhead |
+
+### Who commits, and when
+
+"Commit before" and "commit after" both refer to the **same consumer**. The difference is the order of two steps inside its own poll loop.
+
+```
+At-most-once                         At-least-once (the usual choice)
+
+records = poll()                     records = poll()
+commitOffset()   <- 1. save first    process(records)  <- 1. do the work
+process(records) <- 2. then work     commitOffset()    <- 2. then save
+```
+
+- **At-most-once:** crash between 1 and 2 and the offset is already saved. On restart the consumer resumes *after* those records. They were never processed and never will be.
+- **At-least-once:** crash between 1 and 2 and the offset was not saved. On restart the consumer re-reads and re-processes those records. This is why consumers must be **idempotent**.
+
+How you control it in code: the default consumer has `enable.auto.commit=true`, which commits on a timer during `poll()`. In practice that gives at-least-once, because the commit happens at the start of the *next* poll, after the previous batch was handed to your code. But if your processing is asynchronous and still running when the next poll fires, it silently becomes at-most-once. For explicit control:
+
+```
+enable.auto.commit=false
+consumer.commitSync()   // call after processing, for at-least-once
+```
+
+At-most-once is the cheapest option and fits metrics, telemetry, or sampled click data where a lost record is fine and a duplicate would skew a count. For business events such as payments or orders you almost never want it.
+
+### What "applied exactly once" means
+
+The word **applied** is deliberate. It moves the promise from *delivery* to *outcome*.
+
+Exactly-once *delivery* is impossible in a distributed system: acks get lost and processes crash mid-step, so the same record will sometimes be transmitted or read twice. What Kafka can guarantee is that the **effect** of processing that record shows up in the result exactly once. The record may be read twice, but the output topic ends up with one result record and the offset advances once. Aborted work is never visible to `read_committed` consumers.
+
+Example: a processor sums payments per customer and writes running totals to an output topic.
+
+```
+input:    payment 50 for customer 42
+crash:    after writing total=150 to output, before committing offset
+restart:  re-reads payment 50
+```
+
+Without transactions the output topic shows total=150 and then total=200. The payment was applied twice. With transactions the first total=150 was inside an uncommitted transaction, is aborted on restart, hidden from readers, and the retry writes total=150 once.
+
+This wording also tells you where the guarantee **stops**. The effect Kafka controls is writes to Kafka topics and offset commits. If the processing step also sends an email or updates a SQL row, that effect is outside the transaction and can still happen twice. Read the table as:
+
+- at-most-once: the message may never be processed
+- at-least-once: the message may be processed more than once
+- exactly-once: the message's Kafka-visible result appears once, provided the whole pipeline is Kafka in, Kafka out
 
 ### Producer durability: the `acks` setting
 
@@ -453,12 +625,35 @@ acks=all  "fully replicated" (safest)
 
 With `enable.idempotence=true`, the producer attaches a sequence number to each record so the broker can **deduplicate retries**. This prevents duplicates caused by network retries within a partition. It's the default in modern Kafka and a prerequisite for exactly-once.
 
+The hole it closes:
+
+```
+producer sends batch  ->  broker writes it  ->  ack is lost on the network
+producer times out    ->  retries the same batch  ->  broker writes it AGAIN
+```
+
+Without idempotence the partition now holds the record twice and every consumer sees both. With it, the producer obtains a **producer ID** from the broker and stamps every batch with a **sequence number per partition**. The broker remembers the last sequence it accepted for that producer on that partition. A retried batch arrives with a sequence it has already seen, so the broker drops it and still returns a success ack. Retries become safe.
+
+Scope: one producer, one partition, one session. It does nothing about a crashed producer restarting with a new ID, and nothing about the consumer side.
+
 ### Exactly-once semantics (EOS)
 
-Achieved by combining:
+Achieved by combining two mechanisms that close two **different** duplication holes:
 
-1. **Idempotent producer** (no duplicate writes on retry).
-2. **Transactions** — a producer can write to multiple partitions/topics *and* commit consumer offsets **atomically** (all-or-nothing). This enables the crucial **consume → process → produce** pattern used in stream processing.
+1. **Idempotent producer** (no duplicate writes on retry) closes the hole on the write path, described above.
+2. **Transactions** close the **consume → process → produce** gap. A producer can write to multiple partitions/topics *and* commit consumer offsets **atomically** (all-or-nothing).
+
+The gap transactions close: a stream processor reads from topic A, does work, writes to topic B, and commits its offset on A. Those are two separate writes to Kafka.
+
+```
+write result to B  ->  crash before committing offset on A
+restart            ->  re-read A, write result to B again      (duplicate on B)
+
+or the reverse:
+commit offset on A ->  crash before writing to B                (result lost)
+```
+
+With a transaction the producer opens a transaction, writes to B, adds the consumer offset for A into the same transaction via `sendOffsetsToTransaction()`, then commits. A **transaction coordinator** on the broker writes commit or abort markers into the logs. Either both land or neither does. Downstream consumers set `isolation.level=read_committed` so they never see records from an open or aborted transaction.
 
 ```mermaid
 graph LR
@@ -467,6 +662,10 @@ graph LR
 ```
 
 If the transaction aborts, neither the output write nor the offset commit takes effect — no partial results.
+
+Why you need both: transactions are built **on top of** the idempotent producer. The producer ID and sequence numbers are what let the coordinator identify which writes belong to which transaction and fence off a zombie instance that was replaced after a crash. Setting `transactional.id` turns idempotence on automatically.
+
+The honest caveat: exactly-once holds only **inside Kafka**. If the "process" step writes to a database or calls an HTTP API, that side effect is outside the transaction and can still happen twice. For those cases fall back to at-least-once plus an idempotent consumer, or use the outbox pattern from [Section 12](#12-common-design-patterns).
 
 ---
 
@@ -809,6 +1008,11 @@ A good rule: choose Kafka when you need **high-throughput, durable, replayable, 
 | **acks** | Producer setting for how many acks to wait for (0, 1, all). |
 | **min.insync.replicas** | Minimum ISR count required to accept a write. |
 | **Commit (offset)** | Recording how far a consumer has processed. |
+| **`__consumer_offsets`** | Internal compacted topic where committed offsets are stored, keyed by (group, topic, partition). |
+| **Group Coordinator** | The broker that manages one consumer group's membership, heartbeats, rebalances, and offset commits. |
+| **Transaction Coordinator** | The broker component that tracks a transactional producer's state and writes commit/abort markers. |
+| **`linger.ms` / `batch.size`** | Producer settings bounding how long / how large a batch grows before it is sent. |
+| **`read_committed`** | Consumer isolation level that hides records from open or aborted transactions. |
 | **Consumer Lag** | How far behind a consumer is from the latest offset. |
 | **Rebalance** | Redistribution of partitions among group members. |
 | **Retention** | How long/much data is kept before deletion. |
