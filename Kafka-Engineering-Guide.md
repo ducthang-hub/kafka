@@ -2,12 +2,19 @@
 
 > A ground-up guide to understanding Kafka: what it is, the problems it solves, its core concepts, and how it helps you design fault-tolerant, scalable, event-driven systems.
 
+## Definition in one paragraph
+
+**Apache Kafka** is an open-source, distributed **event streaming platform**. At its core it is a cluster of servers (brokers) that store streams of records in **durable, ordered, append-only logs** called topics, split into partitions and replicated across brokers. Applications called **producers** write records to topics; applications called **consumers** read them back, from any position, at their own pace, without removing them. Because records are kept rather than deleted on read, the same stream can feed many independent consumers and can be replayed later. Kafka was created at LinkedIn in 2011 and is now an Apache Software Foundation project used as the messaging backbone, event store, and data pipeline layer in many large systems.
+
+In one line: **Kafka is a distributed, replicated, replayable commit log that systems publish to and subscribe from.**
+
 ---
 
 ## Table of Contents
 
 1. [Why Kafka Exists — The Problem](#1-why-kafka-exists--the-problem)
 2. [What Kafka Actually Is](#2-what-kafka-actually-is)
+   - [2.1 Kafka vs RabbitMQ](#21-kafka-vs-rabbitmq)
 3. [The Log: Kafka's Foundational Idea](#3-the-log-kafkas-foundational-idea)
 4. [Core Concepts (in the right order)](#4-core-concepts-in-the-right-order)
    - [4.1 Messages / Records](#41-messages--records)
@@ -127,6 +134,64 @@ Three core capabilities:
 3. **Process** streams of events as they occur or retrospectively.
 
 > **Key mental shift:** Kafka is often called a "message queue," but it's more accurate to think of it as a **distributed, append-only, replayable log**. Messages aren't deleted when read — they persist, and many consumers can read the same data independently.
+
+### 2.1 Kafka vs RabbitMQ
+
+The comparison people reach for most often is **RabbitMQ**, a traditional message broker. Both move messages between systems, but they are built on different models, and that difference drives almost every practical distinction.
+
+**The core difference: smart broker vs dumb broker**
+
+```
+RabbitMQ  (smart broker, dumb consumer)
+
+  Producer ──► Exchange ──routing rules──► Queue ──push──► Consumer
+                                            │
+                                            └── message deleted after ack
+
+Kafka  (dumb broker, smart consumer)
+
+  Producer ──► Topic / Partition log ◄──pull (offset)── Consumer
+                        │
+                        └── message retained; consumer tracks its own position
+```
+
+- **RabbitMQ** does the thinking. Exchanges route each message to queues based on bindings, the broker pushes messages to consumers, tracks per-message acknowledgement, and deletes a message once it is acked. The queue is a transient buffer.
+- **Kafka** does very little per message. It appends to a log and serves fetch requests. The consumer decides where to read from and records its own offset. The topic is durable storage.
+
+**Side by side**
+
+| Aspect | Kafka | RabbitMQ |
+|---|---|---|
+| **Model** | Distributed append-only log, pub/sub over partitions | Message broker with exchanges, bindings, and queues (AMQP) |
+| **After a message is read** | Stays in the log until retention expires; can be re-read | Removed from the queue once acknowledged |
+| **Replay / history** | Built in: reset the offset, re-read from any point | Not supported; once consumed it is gone (streams plugin adds a log-style option) |
+| **Delivery** | Consumer **pulls** batches | Broker **pushes** to consumers, with prefetch limits |
+| **Ordering** | Strict per partition; use keys to group related events | Per queue with a single consumer; breaks with multiple competing consumers or requeues |
+| **Routing** | Minimal: producer picks topic and partition | Rich: direct, topic, fanout, headers exchanges; routing keys and wildcards |
+| **Per-message features** | None: no priorities, no per-message TTL, no individual ack/nack | Priorities, per-message TTL, individual ack/nack/requeue, dead-lettering per queue |
+| **Multiple independent readers** | Natural: each consumer group gets the full stream | Needs one queue bound per subscriber; fanout exchange copies the message into each |
+| **Throughput** | Very high: sequential disk I/O, batching, zero-copy; millions of msg/s per cluster | High for a broker, but lower; per-message bookkeeping is the cost |
+| **Latency** | Low milliseconds; batching adds a small floor | Low, often sub-millisecond for small loads |
+| **Scaling consumers** | Add consumers up to the partition count | Add consumers to a queue freely; they compete |
+| **Scaling the broker** | Horizontal: partitions spread across brokers | Clustering and quorum queues; large fan-out is harder to scale |
+| **Durability** | Replicated log, `acks=all`, `min.insync.replicas` | Durable queues plus persistent messages; quorum queues replicate via Raft |
+| **Message size** | Optimized for many small messages; large blobs go elsewhere | Handles larger messages more comfortably |
+| **Stream processing** | Kafka Streams, ksqlDB, Flink connectors, Connect | Not a focus; you process in consumers |
+| **Protocol** | Kafka's own binary protocol | AMQP 0-9-1, plus MQTT and STOMP plugins |
+| **Operational feel** | Heavier: cluster, partitions, retention, lag monitoring | Lighter to start; management UI is excellent |
+
+**When to pick which**
+
+- **Choose Kafka** when you need an **event stream**: high volume, durable history, many independent consumers reading the same data, replay for reprocessing or new services, event sourcing, CDC, or stream processing. Kafka is the backbone of an event-driven architecture.
+- **Choose RabbitMQ** when you need a **task queue or message router**: work distribution to workers, request/reply over messaging, complex routing by content, priorities, per-message expiry, or delayed delivery. RabbitMQ is excellent at "deliver this specific job to one worker and forget it."
+- **Both together** is common: Kafka as the event backbone between services, RabbitMQ for internal job queues inside a service.
+
+**A mental shortcut**
+
+> RabbitMQ answers *"who should handle this message, and did they?"*
+> Kafka answers *"what happened, in what order, and let anyone read it whenever they want."*
+
+If you find yourself wanting to re-read old messages, feed the same data to several teams, or scale past one broker's throughput, you want Kafka. If you find yourself wanting per-message priorities, routing rules, or simple competing workers at modest volume, RabbitMQ will be simpler to run and reason about. [Section 15](#15-when-not-to-use-kafka) expands on the cases where Kafka is the wrong tool.
 
 ---
 
