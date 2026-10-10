@@ -777,6 +777,78 @@ Why you need both: transactions are built **on top of** the idempotent producer.
 
 The honest caveat: exactly-once holds only **inside Kafka**. If the "process" step writes to a database or calls an HTTP API, that side effect is outside the transaction and can still happen twice. For those cases fall back to at-least-once plus an idempotent consumer, or use the outbox pattern from [Section 12](#12-common-design-patterns).
 
+#### Example: a transactional consume → process → produce loop in .NET
+
+A minimal loop using Confluent.Kafka. It reads payments, adds each one to a running total per customer, writes the total to an output topic, and commits the input offset in the **same transaction**.
+
+```csharp
+using Confluent.Kafka;
+
+var consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
+{
+    BootstrapServers = "localhost:9092",
+    GroupId = "payment-totals",
+    EnableAutoCommit = false,                     // offsets go through the transaction instead
+    IsolationLevel = IsolationLevel.ReadCommitted, // never read aborted records
+    AutoOffsetReset = AutoOffsetReset.Earliest,
+}).Build();
+
+var producer = new ProducerBuilder<string, string>(new ProducerConfig
+{
+    BootstrapServers = "localhost:9092",
+    TransactionalId = "payment-totals-1",          // stable across restarts; turns on idempotence
+}).Build();
+
+producer.InitTransactions(TimeSpan.FromSeconds(10)); // registers with the transaction coordinator, fences any zombie with the same id
+consumer.Subscribe("payments");
+
+var totals = new Dictionary<string, decimal>();
+
+while (true)
+{
+    var record = consumer.Consume();               // e.g. key "customer-42", value "50"
+
+    producer.BeginTransaction();
+    try
+    {
+        // 1. process
+        var customer = record.Message.Key;
+        totals[customer] = totals.GetValueOrDefault(customer) + decimal.Parse(record.Message.Value);
+
+        // 2. write the result to the output topic (inside the transaction)
+        producer.Produce("payment-totals",
+            new Message<string, string> { Key = customer, Value = totals[customer].ToString() });
+
+        // 3. commit the input offset (inside the same transaction)
+        producer.SendOffsetsToTransaction(
+            new[] { new TopicPartitionOffset(record.TopicPartition, record.Offset + 1) }, // next offset to read
+            consumer.ConsumerGroupMetadata,
+            TimeSpan.FromSeconds(10));
+
+        // 4. both writes become visible together, or not at all
+        producer.CommitTransaction();
+    }
+    catch (KafkaException)
+    {
+        producer.AbortTransaction();               // output write and offset commit are both discarded
+        // rewind so the record is read again; in-memory totals would also need restoring in real code
+        consumer.Seek(new TopicPartitionOffset(record.TopicPartition, record.Offset));
+    }
+}
+```
+
+How it maps to the concepts above:
+
+- **The gap being closed.** Without a transaction, step 2 and step 3 are separate writes. A crash between them either duplicates the total or loses it. Here they commit as one unit.
+- **The offset goes through the producer, not the consumer.** That is why `EnableAutoCommit` is off and there is no `consumer.Commit()`. The `+ 1` is the "next offset to read" convention from [Section 4.4](#44-offsets).
+- **`TransactionalId` is the crash-restart fix.** A restarted instance with the same ID calls `InitTransactions`, the coordinator bumps the epoch, and the old zombie instance is fenced out. This is what plain idempotence cannot do.
+- **`ReadCommitted` on the reader side.** Any consumer of `payment-totals` must also use it, or it will see records from aborted transactions.
+
+Two simplifications to be aware of:
+
+- One transaction per record is easy to read but slow. Real code batches many records into one transaction.
+- The `totals` dictionary lives in memory, so it is outside the transaction. After an abort or a restart it may be wrong. Kafka Streams solves this by keeping state in a changelog topic that is written inside the same transaction.
+
 ---
 
 ## 7. Ordering, Keys & Partitioning
