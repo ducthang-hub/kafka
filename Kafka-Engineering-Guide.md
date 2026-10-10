@@ -26,6 +26,7 @@ In one line: **Kafka is a distributed, replicated, replayable commit log that sy
    - [4.7 Brokers & the Cluster](#47-brokers--the-cluster)
    - [4.8 Replication (Leaders & Followers)](#48-replication-leaders--followers)
    - [4.9 ZooKeeper vs KRaft](#49-zookeeper-vs-kraft)
+   - [4.10 How Clients Connect: Bootstrap, Handshake & Round Trips](#410-how-clients-connect-bootstrap-handshake--round-trips)
 5. [How a Message Flows End-to-End](#5-how-a-message-flows-end-to-end)
 6. [Delivery Guarantees & Reliability](#6-delivery-guarantees--reliability)
 7. [Ordering, Keys & Partitioning](#7-ordering-keys--partitioning)
@@ -490,7 +491,7 @@ graph TD
 
 - Each broker holds some of the partitions (and their replicas). Partitions are **spread across brokers** to balance load and storage.
 - One broker acts as the **controller** (coordinates administrative work like leader elections and partition assignment).
-- Clients (producers/consumers) can connect to any broker; Kafka tells them which broker leads each partition. This is the **bootstrap** process.
+- Clients (producers/consumers) can connect to any broker; Kafka tells them which broker leads each partition. This is the **bootstrap** process. See [Section 4.10](#410-how-clients-connect-bootstrap-handshake--round-trips) for the full handshake.
 
 Example of partition distribution across brokers for a topic with 3 partitions and replication factor 2:
 
@@ -569,6 +570,185 @@ Kafka needs to store cluster metadata (which brokers exist, who leads each parti
 - **Modern Kafka (KRaft mode):** Kafka manages its own metadata using an internal Raft consensus protocol — **no ZooKeeper needed**. Simpler to operate, faster failovers, scales to more partitions.
 
 > As of recent Kafka versions, **KRaft is the default and ZooKeeper is deprecated/removed**. New deployments should use KRaft. If you see ZooKeeper referenced, it's legacy.
+
+### 4.10 How Clients Connect: Bootstrap, Handshake & Round Trips
+
+Producers and consumers do not talk HTTP to Kafka. They speak Kafka's own **binary protocol** over plain **long-lived TCP connections**. Everything a client does (asking where partitions live, sending records, fetching records, joining a group, committing offsets) is a request/response pair on one of those connections.
+
+#### The wire protocol in 30 seconds
+
+Every request is a length-prefixed frame:
+
+```
+┌────────────┬───────────────────────────────────────────────┬──────────────────┐
+│ size (4 B) │ header: api_key │ api_version │ correlation_id │ client_id │ body │
+└────────────┴───────────────────────────────────────────────┴──────────────────┘
+```
+
+- **`api_key`** says what the request is: `Produce`, `Fetch`, `Metadata`, `JoinGroup`, `OffsetCommit`, and so on. Each API is versioned independently.
+- **`correlation_id`** is a number the client picks. The broker copies it into the response so the client can match responses to requests.
+- **`client_id`** is the `client.id` setting. It shows up in broker logs, metrics and quotas, so set it to something meaningful.
+
+Two rules make the protocol simple to reason about:
+
+- The broker processes requests from **one connection strictly in order** and replies in the same order.
+- The client may **pipeline** several requests on one connection without waiting for each reply, up to `max.in.flight.requests.per.connection` (default 5). This is why that setting matters for ordering in [Section 4.5](#45-producers) and [Section 6](#6-delivery-guarantees--reliability).
+
+#### Step 1: bootstrap and the connection handshake
+
+`bootstrap.servers` is only a **starting list**. The client needs just one reachable broker from it to learn about the whole cluster. List two or three so startup survives one broker being down.
+
+Opening any connection to any broker goes through the same sequence:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant B as Bootstrap broker
+
+    C->>B: TCP connect (SYN / SYN-ACK / ACK)
+    opt security.protocol = SSL or SASL_SSL
+        C->>B: TLS handshake (certificates, cipher)
+        B-->>C: TLS established
+    end
+    C->>B: ApiVersions request
+    B-->>C: Supported API versions per api_key
+    opt security.protocol = SASL_PLAINTEXT or SASL_SSL
+        C->>B: SaslHandshake (mechanism, e.g. SCRAM-SHA-512)
+        B-->>C: Mechanism accepted
+        C->>B: SaslAuthenticate (one or more round trips)
+        B-->>C: Authenticated as principal "User:orders-svc"
+    end
+    C->>B: Metadata request (topics I care about)
+    B-->>C: Brokers (id, host, port), controller, per-partition leader / replicas / ISR
+```
+
+1. **TCP connect** to one of the bootstrap addresses. If it fails, the client tries the next address, backing off between attempts (`reconnect.backoff.ms`, `reconnect.backoff.max.ms`).
+2. **TLS handshake**, only if `security.protocol` is `SSL` or `SASL_SSL`. Same as HTTPS: the broker presents a certificate, the client verifies it (and with mTLS the client presents one too).
+3. **ApiVersions**. The client asks "which versions of each API do you support?" and then uses the highest version both sides understand. This is how a new client can talk to an older broker and vice versa.
+4. **SASL authentication**, only for `SASL_*` protocols. `PLAIN` is a single round trip; `SCRAM` takes two (challenge and response); `OAUTHBEARER` sends a token. After this the connection is bound to a **principal**, and every later request is checked against ACLs as that principal.
+5. **Metadata**. The broker returns the list of brokers in the cluster and, for each partition, which broker is the **leader**. The client caches this.
+
+That is roughly **3 to 6 round trips** before the first useful byte of data, which is why connections are opened once and reused for the life of the client.
+
+#### Step 2: connect to the brokers that matter
+
+The bootstrap broker is not a proxy. After the metadata response, the client opens **its own connection to each broker that leads a partition it needs**, repeating the handshake above for each one. A producer writing to partitions led by brokers 1, 2 and 3 ends up with three connections; it will never route data through the bootstrap broker unless that broker happens to lead a partition.
+
+```
+                      Metadata says:
+                      P0 → Broker 1, P1 → Broker 2, P2 → Broker 3
+
+  Producer ──bootstrap──► Broker 2   (only used to learn the map)
+     │
+     ├──── conn ───► Broker 1   Produce(P0)
+     ├──── conn ───► Broker 2   Produce(P1)
+     └──── conn ───► Broker 3   Produce(P2)
+```
+
+The host and port the client dials come from the broker's **`advertised.listeners`**, not from what you put in `bootstrap.servers`. This is the most common cause of "it connects, then fails":
+
+- The client reaches `localhost:9092` fine and gets metadata.
+- The metadata says the leader is at `kafka:19092`.
+- The client, running on your host, cannot resolve `kafka`, and every Produce or Fetch fails.
+
+The `INTERNAL` and `EXTERNAL` listeners in `SETUP.md` exist to fix exactly this: containers are told `kafka:19092`, host clients are told `localhost:9092`.
+
+**Keeping the map fresh.** The cached metadata goes stale when leaders move (a broker dies, a rebalance of leadership runs, partitions are added). The client refreshes it:
+
+- On a timer, every `metadata.max.age.ms` (default 5 minutes).
+- Immediately when a broker answers with an error such as `NOT_LEADER_OR_FOLLOWER` or `UNKNOWN_TOPIC_OR_PARTITION`. The client re-fetches metadata, finds the new leader, connects to it, and retries. Your application usually never sees this.
+
+#### Step 3a: the producer's round trips
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant A as Any broker
+    participant L as Partition leader
+
+    P->>A: Metadata (topic "orders")
+    A-->>P: Leaders for each partition
+    P->>A: InitProducerId (idempotence on)
+    A-->>P: Producer ID + epoch
+    loop for each batch
+        P->>L: Produce (batch for partition N, acks=all)
+        L-->>P: Produce response (base offset or error)
+    end
+```
+
+- **Metadata**: covered above. Sent the first time you produce to a topic the client has not seen yet.
+- **InitProducerId**: gets the producer ID used by the idempotent producer (see [Section 6](#idempotent-producer)). Transactional producers first send `FindCoordinator` to locate their **transaction coordinator** and send `InitProducerId` there instead.
+- **Produce**: one request carries batches for one or more partitions that share a leader. The response holds the offset assigned to the first record in each batch. With `acks=0` the broker sends **no response** at all; the producer just writes to the socket and moves on.
+
+If no response arrives within `request.timeout.ms` (default 30 s) the producer treats the request as failed and retries, up to `delivery.timeout.ms` in total.
+
+#### Step 3b: the consumer's round trips
+
+A consumer in a group has more to set up, because it must find its group, get a partition assignment, and work out where to start reading.
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer
+    participant A as Any broker
+    participant G as Group coordinator
+    participant L as Partition leader
+
+    C->>A: Metadata
+    A-->>C: Brokers and partition leaders
+    C->>A: FindCoordinator (group.id = "billing")
+    A-->>C: Coordinator is Broker 2
+    C->>G: JoinGroup
+    G-->>C: Member ID (one member is chosen as leader)
+    C->>G: SyncGroup (leader sends the assignment plan)
+    G-->>C: Your partitions: P0, P3
+    C->>G: OffsetFetch (P0, P3)
+    G-->>C: Committed offsets (or none)
+    opt no committed offset
+        C->>L: ListOffsets (earliest or latest, per auto.offset.reset)
+        L-->>C: Starting offset
+    end
+    loop poll loop
+        C->>L: Fetch (P0 from offset X)
+        L-->>C: Records (or empty after fetch.max.wait.ms)
+        C-->>G: Heartbeat (background thread)
+        C->>G: OffsetCommit
+    end
+    C->>G: LeaveGroup (on clean shutdown)
+```
+
+- **FindCoordinator**: each group is owned by one broker, the **group coordinator**. Which broker it is depends on a hash of the `group.id` (it is the leader of the matching `__consumer_offsets` partition).
+- **JoinGroup / SyncGroup**: the two-phase dance that produces the partition assignment. Every rebalance in [Section 8](#8-consumer-group-rebalancing) repeats these two calls.
+- **OffsetFetch**: "where did my group leave off on these partitions?" If there is no committed offset, `auto.offset.reset` decides via **ListOffsets**.
+- **Fetch**: a **long poll**. The broker holds the request until it has at least `fetch.min.bytes` of data or `fetch.max.wait.ms` (default 500 ms) passes. This is why an idle consumer does not spin the CPU or flood the network.
+- **Heartbeat**: sent from a background thread every `heartbeat.interval.ms` (default 3 s). If the coordinator hears nothing for `session.timeout.ms` (default 45 s) it declares the consumer dead and rebalances.
+- **OffsetCommit**: goes to the coordinator, not the partition leader (see [Section 4.4](#44-offsets)).
+- **LeaveGroup**: sent on `Close()`. It lets the group rebalance right away instead of waiting for the session timeout. Always close consumers cleanly.
+
+> **Newer Kafka (4.0+):** the new consumer group protocol (KIP-848, `group.protocol=consumer`) replaces `JoinGroup` / `SyncGroup` / `Heartbeat` with a single `ConsumerGroupHeartbeat` call, and the **broker** computes the assignment. Fewer round trips per rebalance and no group-wide pause. The rest of the flow (Metadata, Fetch, OffsetCommit) is unchanged.
+
+#### How many connections does one client open?
+
+Typically **one connection per broker it needs to talk to**, kept open and reused. A consumer opens one extra connection to its group coordinator so heartbeats and commits do not queue behind a large fetch on the same socket. A service with 3 consumers and 1 producer against a 3-broker cluster can easily hold a dozen connections. Multiply by replicas and pods when sizing broker connection limits.
+
+Idle connections are closed after `connections.max.idle.ms` (default 9 minutes on clients, 10 minutes on brokers) and reopened transparently on the next request.
+
+#### Connection settings worth knowing
+
+| Setting | Default | What it controls |
+|---|---|---|
+| `bootstrap.servers` | — | Initial brokers to discover the cluster from. List more than one. |
+| `client.id` | empty | Name shown in broker logs, metrics and quotas. |
+| `security.protocol` | `PLAINTEXT` | `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT`, `SASL_SSL`. Decides whether TLS and/or SASL run in the handshake. |
+| `sasl.mechanism` | `GSSAPI` | `PLAIN`, `SCRAM-SHA-256/512`, `OAUTHBEARER`, `GSSAPI` (Kerberos). |
+| `request.timeout.ms` | 30000 | How long to wait for a response before treating the request as failed. |
+| `metadata.max.age.ms` | 300000 | Forced metadata refresh interval. |
+| `reconnect.backoff.ms` / `reconnect.backoff.max.ms` | 50 / 1000 | Backoff between reconnect attempts to a broker. |
+| `connections.max.idle.ms` | 540000 | Close connections idle for this long. |
+| `max.in.flight.requests.per.connection` | 5 | Requests pipelined on one connection before waiting for replies. |
+
+Defaults above are for the Java client. Confluent.Kafka (.NET) is built on librdkafka, which uses the same property names (`BootstrapServers`, `SecurityProtocol`, `SaslMechanism`, ...) but a few defaults differ.
+
+**Seeing it happen.** In Confluent.Kafka set `Debug = "broker,protocol,security"` on the config to log every connection, ApiVersions exchange, SASL step and request. In the Java client, set the `org.apache.kafka.clients.NetworkClient` logger to `DEBUG`.
 
 ---
 
@@ -848,6 +1028,42 @@ Two simplifications to be aware of:
 
 - One transaction per record is easy to read but slow. Real code batches many records into one transaction.
 - The `totals` dictionary lives in memory, so it is outside the transaction. After an abort or a restart it may be wrong. Kafka Streams solves this by keeping state in a changelog topic that is written inside the same transaction.
+
+#### What happens to the duplicate when a transactional producer crashes
+
+Transactions do **not** stop the duplicate from being written. If the producer sends a record, the leader appends and replicates it, and the producer crashes before committing, that record is already in the log. The restarted producer writes it again. Both copies are physically on disk.
+
+What changes is **whether anyone sees it**. Stored is not the same as delivered:
+
+```
+offset 7: "order-42"   (txn, epoch 4)  ← stored, marked ABORTED
+offset 8: abort marker
+offset 9: "order-42"   (txn, epoch 5)  ← stored, COMMITTED
+```
+
+- A `read_committed` consumer receives **only offset 9**. Application code never sees offset 7 and needs no dedupe logic for this case.
+- The aborted record only costs disk space until retention removes it.
+
+A database behaves the same way: a rolled-back insert leaves traces in the write-ahead log, but no query returns it. The guarantee is **"no duplicate visible to consumers"**, not "no duplicate on disk", and the first is what matters for correctness.
+
+Note the mechanism is **committed vs aborted**, not "keep the newest". The consumer never compares the two copies. It skips anything from an aborted transaction wherever it sits in the log. ("Latest wins per key" is log compaction, a different feature; see [Section 9](#9-data-retention-log-compaction--storage).)
+
+**What the stable `transactional.id` adds.** Transactions are what hide the aborted copy. Keeping the same `transactional.id` across restarts decides how fast and how safely the abort happens:
+
+| | New random ID on restart | Same ID on restart |
+|---|---|---|
+| Old open transaction | Stays open until `transaction.timeout.ms` (default 60 s), then aborted by the coordinator | Aborted **immediately** inside `InitTransactions` |
+| `read_committed` consumers meanwhile | **Stuck**: they cannot read past an open transaction on that partition | Not blocked |
+| Old instance was only paused (GC, network split) and wakes up | Can still **commit** its transaction, so the second copy is committed too: a **real duplicate** | Rejected with `ProducerFenced` because its epoch is older |
+
+So the stable ID is responsible for:
+
+1. **Fencing.** It is the only thing that stops a zombie instance from committing its copy. Without it, both copies can end up committed and visible.
+2. **Immediate cleanup.** The leftover transaction is aborted at once instead of blocking consumers for up to a minute.
+
+In one line: **transactions hide the duplicate; the stable `transactional.id` ensures only one instance can ever commit it.** Neither removes it from disk, and neither needs to.
+
+**Where this stops working.** All of the above covers a crash **before** `CommitTransaction`. If the crash happens **after** the commit succeeded but before the application recorded that the message was sent, the restart sends it again in a new, valid transaction. Both copies are committed and `read_committed` shows both. This cannot happen in the consume → process → produce loop above, because the "already sent" marker is the input offset, committed in the same transaction. It can happen when the source is a database, HTTP request or file. Then consumers must deduplicate by a deterministic message ID (see the caveat above and [Section 12](#12-common-design-patterns)).
 
 ---
 
